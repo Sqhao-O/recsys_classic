@@ -1,0 +1,8 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+
+# 原始数据和预处理产物体积较大，不纳入版本管理。
+src/datasets/
