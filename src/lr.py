@@ -3,12 +3,13 @@ import torch  # 导入 PyTorch，用于建立和训练 LR 模型
 
 from pathlib import Path  # 导入 Path，用于处理文件路径
 from scipy import sparse  # 导入 SciPy 稀疏矩阵模块
+from sklearn.metrics import roc_auc_score  # 导入 AUC 指标，用于评价点击分数的排序能力
 from torch.utils.data import Dataset, DataLoader  # 导入 PyTorch 数据集和加载器
 
 
 # ==================== 1. 设置数据路径 ====================
 
-base_dir = Path(__file__).resolve().parent
+base_dir = Path(__file__).resolve().parent  # __file__ 是当前脚本路径；resolve() 转为绝对路径，parent 取得其所在目录
 data_dir = base_dir / "datasets/Criteo/processed"  # 设置预处理数据所在目录
 
 # ==================== 2. 定义数据集 ====================
@@ -16,12 +17,9 @@ data_dir = base_dir / "datasets/Criteo/processed"  # 设置预处理数据所在
 class CriteoDataset(Dataset):  # 定义 Criteo 数据集类，继承 PyTorch Dataset
 
     def __init__(self, feature_path, common_path):  # 初始化时传入特征文件和通用数据文件路径
-        self.x_data = sparse.load_npz(feature_path).tocsr()  # 读取已经编码好的 LR 稀疏特征，并确保使用 CSR 格式
+        self.x_data = sparse.load_npz(feature_path)  # 预处理已将 LR 特征保存为 float32 的 CSR 矩阵
         with np.load(common_path) as data:  # 打开通用数据文件
-            labels = data["labels"].astype(np.float32)  # 读取已经保存好的标签，并确保类型为 float32
-        self.y_data = torch.from_numpy(labels)  # 将 NumPy 标签转换为 PyTorch 张量
-        self.len = self.x_data.shape[0]  # 保存数据集的样本数量
-        assert self.len == self.y_data.shape[0], "特征数量与标签数量不一致"  # 检查特征和标签是否一一对应
+            self.y_data = torch.from_numpy(data["labels"])  # 标签已是 float32，直接转换为张量
 
     def __getitem__(self, index):  # 定义如何获取指定索引的一条样本
         '''note
@@ -30,10 +28,11 @@ class CriteoDataset(Dataset):  # 定义 Criteo 数据集类，继承 PyTorch Dat
         3. toarray()：将稀疏矩阵转换为普通 NumPy 数组。
         4. ravel()：将数组展平为一维，形状从 (1, n) 变为 (n,)。
         '''
-        return torch.from_numpy(self.x_data[index].toarray().ravel().astype(np.float32)), self.y_data[index]  # 返回特征与标签组成的元组
+        x = torch.from_numpy(self.x_data[index].toarray().ravel())
+        return x, self.y_data[index]  # 返回特征与标签组成的元组
 
     def __len__(self):  # 定义如何获取数据集长度
-        return self.len  # 返回样本总数
+        return self.x_data.shape[0]  # 直接读取样本总数，无需额外保存
 
 # ==================== 3. 创建训练集和验证集 ====================
 
@@ -49,19 +48,9 @@ val_data = CriteoDataset(
 
 # ==================== 4. 创建 DataLoader ====================
 
-train_loader = DataLoader(
-    dataset=train_data,  # 指定训练数据集
-    batch_size=256,  # 每个 Batch 包含 256 条样本
-    shuffle=True,  # 每轮训练打乱数据顺序
-    num_workers=0  # 暂时使用主进程加载数据
-)
-
-val_loader = DataLoader(
-    dataset=val_data,  # 指定验证数据集
-    batch_size=256,  # 每次验证读取 256 条样本
-    shuffle=False,  # 验证集不需要打乱
-    num_workers=0  # 使用主进程加载
-)
+# 默认 num_workers=0，在主进程中加载数据；验证集默认不打乱。
+train_loader = DataLoader(train_data, batch_size=256, shuffle=True)
+val_loader = DataLoader(val_data, batch_size=256)
 
 # ==================== 5. 定义 LR 模型 ====================
 
@@ -69,10 +58,7 @@ class LR(torch.nn.Module):  # 定义逻辑回归模型
 
     def __init__(self, input_dim):  # 初始化模型，传入输入特征维度
         super().__init__()  # 初始化父类 nn.Module
-        self.linear = torch.nn.Linear(
-            in_features=input_dim,  # 输入维度等于编码后的特征总数
-            out_features=1  # 二分类任务只输出一个 Logit
-        )
+        self.linear = torch.nn.Linear(input_dim, out_features=1)
 
     def forward(self, x):  # 定义前向传播方法
         return self.linear(x)  # 计算线性组合并返回原始 Logit
@@ -92,7 +78,7 @@ optimizer = torch.optim.SGD(
     lr=0.01  # 设置学习率
 )
 
-# ==================== 8. 开始训练 ====================
+# ==================== 8. 训练并逐轮验证 ====================
 
 num_epochs = 100  # 设置总训练轮数
 
@@ -110,34 +96,34 @@ for epoch in range(num_epochs):  # 循环执行多个 Epoch
 
     avg_train_loss = total_train_loss / len(train_data)  # 根据训练样本总数计算平均损失
 
-    print(
-        f"Epoch [{epoch + 1}/{num_epochs}], "  # 输出当前训练轮数
-        f"Train Loss: {avg_train_loss:.4f}"  # 输出平均训练损失
+    model.eval()  # 每轮训练结束后切换为评估模式
+    correct = 0  # 初始化当前轮预测正确的样本数
+    total_val_loss = 0.0  # 初始化当前轮验证集累计损失
+    val_logits = []  # 保存整个验证集的原始分数，用于计算 AUC
+    val_labels = []  # 保存与分数一一对应的真实标签
+
+    with torch.no_grad():  # 验证时关闭梯度计算
+        for input_val, label_val in val_loader:  # 按 Batch 读取验证集
+            logits = model(input_val)  # 前向传播，得到原始 Logit
+            loss = criterion(logits, label_val)  # 计算当前 Batch 的平均验证损失
+            total_val_loss += loss.item() * input_val.shape[0]  # 按样本数量累加，正确处理最后一个较小的 Batch
+            pred_label = logits >= 0  # 等价于 Sigmoid 概率 >= 0.5，无需额外转换
+            correct += (pred_label == label_val).sum().item()  # 统计预测正确的样本数
+            val_logits.append(logits)
+            val_labels.append(label_val)
+
+    avg_val_loss = total_val_loss / len(val_data)  # 计算整个验证集的平均损失
+    accuracy = correct / len(val_data)  # 计算验证集准确率
+    # AUC 使用整个验证集的排序分数计算；Logit 可直接使用，无需先计算 Sigmoid。
+    val_auc = roc_auc_score(
+        torch.cat(val_labels).numpy().ravel(),
+        torch.cat(val_logits).numpy().ravel()
     )
 
-
-# ==================== 9. 验证模型 ====================
-
-model.eval()  # 将模型切换为评估模式
-correct = 0  # 初始化预测正确的样本数
-total = len(val_data)  # 初始化验证集总样本数
-total_val_loss = 0.0  # 初始化验证集累计损失
-
-with torch.no_grad():  # 验证时关闭梯度计算
-    for input_val, label_val in val_loader:  # 按 Batch 读取验证集
-        logits = model(input_val)  # 前向传播，得到原始 Logit
-        loss = criterion(logits, label_val)  # 计算当前 Batch 的平均验证损失
-        total_val_loss += loss.item() * input_val.shape[0]  # 按样本数量累加验证损失
-        prob = torch.sigmoid(logits)  # 使用 Sigmoid 将 Logit 转换为点击概率
-        pred_label = (prob >= 0.5).float()  # 概率大于等于 0.5 预测为 1，否则为 0
-        correct += (pred_label == label_val).sum().item()  # 统计当前 Batch 预测正确的样本数量
-
-# ==================== 10. 输出验证结果 ====================
-
-avg_val_loss = total_val_loss / total  # 计算验证集平均损失
-
-accuracy = correct / total  # 计算验证集准确率
-
-print(f"验证集 Loss: {avg_val_loss:.4f}")  # 输出验证损失
-
-print(f"验证集 Accuracy: {accuracy * 100:.2f}%")  # 输出验证准确率
+    print(
+        f"Epoch [{epoch + 1}/{num_epochs}], "
+        f"Train Loss: {avg_train_loss:.4f}, "
+        f"Val Loss: {avg_val_loss:.4f}, "
+        f"Val AUC: {val_auc:.4f}, "
+        f"Val Accuracy: {accuracy * 100:.2f}%"
+    )
