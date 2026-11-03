@@ -6,3 +6,21 @@ __pycache__/
 
 # 原始数据和预处理产物体积较大，不纳入版本管理。
 src/datasets/
+
+# 本机环境、凭据与运行结果不公开。
+.vscode/
+.idea/
+notebook/
+.env
+.env.*
+!.env.example
+.aws/
+.ssh/
+.codex/
+.agents/
+*.pem
+*.key
+*.log
+checkpoints/
+*.pt
+*.pth
